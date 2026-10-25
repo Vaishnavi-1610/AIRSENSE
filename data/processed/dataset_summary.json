@@ -1,0 +1,187 @@
+{
+  "dataset_name": "xKDR CPCB CAAQM India Air Quality Dataset",
+  "provenance": "Continuous Ambient Air Quality Monitoring Stations (CAAQMS) network published by xKDR / CPCB",
+  "total_raw_rows_downloaded": 533748,
+  "total_station_day_observations_processed": 498509,
+  "total_city_day_aggregated_records": 9116,
+  "unique_cities_count": 10,
+  "available_cities": [
+    "Ahmedabad",
+    "Bengaluru",
+    "Chennai",
+    "Delhi",
+    "Hyderabad",
+    "Kolkata",
+    "Mumbai",
+    "Nagpur",
+    "Nashik",
+    "Pune"
+  ],
+  "earliest_date": "2023-01-01",
+  "latest_date": "2025-09-30",
+  "cpcb_aqi_records_count": 7287,
+  "cpcb_aqi_coverage_pct": 79.9,
+  "per_city_summary": {
+    "Ahmedabad": {
+      "total_days": 885,
+      "date_range": "2023-01-01 to 2025-09-01",
+      "cpcb_aqi_days": 731,
+      "cpcb_aqi_pct": 82.6,
+      "mean_aqi": 109.1,
+      "max_aqi": 312.0,
+      "min_aqi": 28.0,
+      "stations_reporting_avg": 6.8,
+      "missing_aqi_note": "In 2025, gases (NO2, SO2, CO, Ozone) are pending publication in xKDR; CPCB NAQI requires >=3 pollutants including PM to calculate genuine AQI."
+    },
+    "Bengaluru": {
+      "total_days": 885,
+      "date_range": "2023-01-01 to 2025-09-01",
+      "cpcb_aqi_days": 731,
+      "cpcb_aqi_pct": 82.6,
+      "mean_aqi": 72.5,
+      "max_aqi": 348.0,
+      "min_aqi": 27.0,
+      "stations_reporting_avg": 11.3,
+      "missing_aqi_note": "In 2025, gases (NO2, SO2, CO, Ozone) are pending publication in xKDR; CPCB NAQI requires >=3 pollutants including PM to calculate genuine AQI."
+    },
+    "Chennai": {
+      "total_days": 975,
+      "date_range": "2023-01-01 to 2025-09-01",
+      "cpcb_aqi_days": 731,
+      "cpcb_aqi_pct": 75.0,
+      "mean_aqi": 67.7,
+      "max_aqi": 325.0,
+      "min_aqi": 24.0,
+      "stations_reporting_avg": 6.0,
+      "missing_aqi_note": "In 2025, gases (NO2, SO2, CO, Ozone) are pending publication in xKDR; CPCB NAQI requires >=3 pollutants including PM to calculate genuine AQI."
+    },
+    "Delhi": {
+      "total_days": 885,
+      "date_range": "2023-01-01 to 2025-09-01",
+      "cpcb_aqi_days": 731,
+      "cpcb_aqi_pct": 82.6,
+      "mean_aqi": 210.3,
+      "max_aqi": 500.0,
+      "min_aqi": 39.0,
+      "stations_reporting_avg": 36.7,
+      "missing_aqi_note": "In 2025, gases (NO2, SO2, CO, Ozone) are pending publication in xKDR; CPCB NAQI requires >=3 pollutants including PM to calculate genuine AQI."
+    },
+    "Hyderabad": {
+      "total_days": 970,
+      "date_range": "2023-01-01 to 2025-09-30",
+      "cpcb_aqi_days": 731,
+      "cpcb_aqi_pct": 75.4,
+      "mean_aqi": 81.4,
+      "max_aqi": 303.0,
+      "min_aqi": 35.0,
+      "stations_reporting_avg": 10.9,
+      "missing_aqi_note": "In 2025, gases (NO2, SO2, CO, Ozone) are pending publication in xKDR; CPCB NAQI requires >=3 pollutants including PM to calculate genuine AQI."
+    },
+    "Kolkata": {
+      "total_days": 936,
+      "date_range": "2023-01-01 to 2025-09-01",
+      "cpcb_aqi_days": 731,
+      "cpcb_aqi_pct": 78.1,
+      "mean_aqi": 107.1,
+      "max_aqi": 337.0,
+      "min_aqi": 22.0,
+      "stations_reporting_avg": 7.1,
+      "missing_aqi_note": "In 2025, gases (NO2, SO2, CO, Ozone) are pending publication in xKDR; CPCB NAQI requires >=3 pollutants including PM to calculate genuine AQI."
+    },
+    "Mumbai": {
+      "total_days": 947,
+      "date_range": "2023-01-01 to 2025-09-01",
+      "cpcb_aqi_days": 731,
+      "cpcb_aqi_pct": 77.2,
+      "mean_aqi": 97.7,
+      "max_aqi": 309.0,
+      "min_aqi": 23.0,
+      "stations_reporting_avg": 21.2,
+      "missing_aqi_note": "In 2025, gases (NO2, SO2, CO, Ozone) are pending publication in xKDR; CPCB NAQI requires >=3 pollutants including PM to calculate genuine AQI."
+    },
+    "Nagpur": {
+      "total_days": 885,
+      "date_range": "2023-01-01 to 2025-09-01",
+      "cpcb_aqi_days": 731,
+      "cpcb_aqi_pct": 82.6,
+      "mean_aqi": 106.2,
+      "max_aqi": 329.0,
+      "min_aqi": 20.0,
+      "stations_reporting_avg": 3.3,
+      "missing_aqi_note": "In 2025, gases (NO2, SO2, CO, Ozone) are pending publication in xKDR; CPCB NAQI requires >=3 pollutants including PM to calculate genuine AQI."
+    },
+    "Nashik": {
+      "total_days": 883,
+      "date_range": "2023-01-01 to 2025-09-01",
+      "cpcb_aqi_days": 728,
+      "cpcb_aqi_pct": 82.4,
+      "mean_aqi": 79.9,
+      "max_aqi": 314.0,
+      "min_aqi": 20.0,
+      "stations_reporting_avg": 3.3,
+      "missing_aqi_note": "In 2025, gases (NO2, SO2, CO, Ozone) are pending publication in xKDR; CPCB NAQI requires >=3 pollutants including PM to calculate genuine AQI."
+    },
+    "Pune": {
+      "total_days": 865,
+      "date_range": "2023-01-21 to 2025-09-01",
+      "cpcb_aqi_days": 711,
+      "cpcb_aqi_pct": 82.2,
+      "mean_aqi": 105.4,
+      "max_aqi": 347.0,
+      "min_aqi": 34.0,
+      "stations_reporting_avg": 4.7,
+      "missing_aqi_note": "In 2025, gases (NO2, SO2, CO, Ozone) are pending publication in xKDR; CPCB NAQI requires >=3 pollutants including PM to calculate genuine AQI."
+    }
+  },
+  "pollutant_coverage": {
+    "pm25": {
+      "valid_records": 9115,
+      "coverage_pct": 100.0,
+      "mean": 45.06,
+      "min": 3.38,
+      "max": 592.02
+    },
+    "pm10": {
+      "valid_records": 8827,
+      "coverage_pct": 96.8,
+      "mean": 93.14,
+      "min": 10.32,
+      "max": 765.86
+    },
+    "no2": {
+      "valid_records": 7288,
+      "coverage_pct": 79.9,
+      "mean": 25.46,
+      "min": 1.35,
+      "max": 142.17
+    },
+    "so2": {
+      "valid_records": 7232,
+      "coverage_pct": 79.3,
+      "mean": 14.76,
+      "min": 0.6,
+      "max": 167.76
+    },
+    "co": {
+      "valid_records": 7288,
+      "coverage_pct": 79.9,
+      "mean": 0.87,
+      "min": 0.17,
+      "max": 3.01
+    },
+    "ozone": {
+      "valid_records": 7262,
+      "coverage_pct": 79.7,
+      "mean": 27.66,
+      "min": 3.07,
+      "max": 76.73
+    },
+    "aqi": {
+      "valid_records": 7287,
+      "coverage_pct": 79.9,
+      "mean": 103.73,
+      "min": 20.0,
+      "max": 500.0
+    }
+  }
+}
