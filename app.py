@@ -1,20 +1,58 @@
+
 import streamlit as st
 import requests
+import pandas as pd
 
 st.set_page_config(page_title="AIRSENSE", layout="wide")
+
+API = "https://air-quality-prediction-api-mpy3.onrender.com"
+
 st.title("🌍 AIRSENSE")
-st.subheader("Air Quality Prediction and Pollution Monitoring")
+st.subheader("AI-Based Air Quality Prediction & Pollution Monitoring")
 
-API_URL = "https://air-quality-prediction-api-mpy3.onrender.com"
+@st.cache_data(ttl=60)
+def get_data(endpoint, params=None):
+    response = requests.get(
+        f"{API}/api/{endpoint}",
+        params=params,
+        timeout=90
+    )
+    response.raise_for_status()
+    return response.json()
 
-if st.button("Check backend connection"):
+page = st.sidebar.radio(
+    "Navigation",
+    ["Dashboard", "AQI Prediction", "Pollution Alerts", "API Status"]
+)
+
+if page == "API Status":
     try:
-        response = requests.get(f"{API_URL}/docs", timeout=30)
-        if response.status_code == 200:
-            st.success("Backend is reachable!")
-        else:
-            st.warning(f"Backend returned status: {response.status_code}")
-    except requests.RequestException as e:
-        st.error(f"Connection failed: {e}")
+        data = get_data("health")
+        st.success("Backend connected")
+        st.json(data)
+    except Exception as e:
+        st.error(f"Backend error: {e}")
 
-st.info("This is the initial Streamlit interface. Prediction and clustering features still need to be connected.")
+elif page == "Dashboard":
+    st.header("Air Quality Dashboard")
+    try:
+        data = get_data("dataset/info")
+        st.json(data)
+    except Exception as e:
+        st.error(f"Could not load dashboard data: {e}")
+
+elif page == "AQI Prediction":
+    st.header("Daily Air Quality Prediction")
+    try:
+        data = get_data("predict/daily")
+        st.json(data)
+    except Exception as e:
+        st.error(f"Prediction request failed: {e}")
+
+elif page == "Pollution Alerts":
+    st.header("High Pollution Alerts")
+    try:
+        data = get_data("alerts/high-pollution")
+        st.json(data)
+    except Exception as e:
+        st.error(f"Could not load alerts: {e}")
