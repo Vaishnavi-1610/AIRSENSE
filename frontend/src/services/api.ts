@@ -15,8 +15,7 @@ import {
   HighPollutionAlertSummary
 } from '../types';
 
-const API_BASE = '/api';
-
+const API_BASE = 'https://air-quality-prediction-api-mpy3.onrender.com/api';
 const apiClient = axios.create({
   baseURL: API_BASE,
   timeout: 45000,
