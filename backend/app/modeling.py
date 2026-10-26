@@ -1,8 +1,11 @@
+
 import os
 import json
 import logging
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
+
 import pandas as pd
 import numpy as np
 import joblib
@@ -11,18 +14,23 @@ from app.config import (
     MODELS_CACHE_DIR,
     get_aqi_category_info,
     AQI_CATEGORIES,
-    get_current_kolkata_date
+    get_current_kolkata_date,
 )
 from app.live_aqi_service import fetch_live_observation_for_city
 
 logger = logging.getLogger(__name__)
 
+
 class ForecastEngine:
     """
-    Direct Multi-Horizon Daily Forecasting Engine for 1 to 5 Days.
-    Uses pre-trained, chronologically-validated regression models with zero future target leakage.
-    Provides calibrated uncertainty bounds and practical public health advisories.
+    Daily multi-horizon AQI forecasting engine.
+
+    Uses cached models when available. Historical evaluation never substitutes
+    the observed AQI for a prediction. If model artifacts are unavailable,
+    a clearly identified rolling-mean baseline is used instead.
     """
+
+    POLLUTANTS = ("pm25", "pm10", "no2", "so2", "co", "ozone")
 
     def __init__(self, target_col: str = "aqi"):
         self.target_col = target_col
@@ -33,397 +41,495 @@ class ForecastEngine:
         self._load_cached_models()
 
     def _load_cached_models(self):
-        models_path = MODELS_CACHE_DIR / "multi_horizon_models.joblib"
-        scalers_path = MODELS_CACHE_DIR / "multi_horizon_scalers.joblib"
-        meta_path = MODELS_CACHE_DIR / "feature_metadata.json"
-        metrics_path = MODELS_CACHE_DIR / "model_evaluation_metrics.json"
+        models_path = Path(MODELS_CACHE_DIR) / "multi_horizon_models.joblib"
+        scalers_path = Path(MODELS_CACHE_DIR) / "multi_horizon_scalers.joblib"
+        meta_path = Path(MODELS_CACHE_DIR) / "feature_metadata.json"
+        metrics_path = Path(MODELS_CACHE_DIR) / "model_evaluation_metrics.json"
 
-        if models_path.exists() and scalers_path.exists() and meta_path.exists():
-            try:
-                self.models = joblib.load(models_path)
-                self.scalers = joblib.load(scalers_path)
-                with open(meta_path, "r", encoding="utf-8") as f:
-                    meta = json.load(f)
-                    self.feature_cols = meta.get("feature_cols", [])
-                if metrics_path.exists():
-                    with open(metrics_path, "r", encoding="utf-8") as f:
-                        self.metrics = json.load(f)
-                logger.info("Successfully loaded multi-horizon forecasting artifacts from cache.")
-                return
-            except Exception as e:
-                logger.warning(f"Error loading cached model artifacts: {e}")
+        if not (
+            models_path.exists()
+            and scalers_path.exists()
+            and meta_path.exists()
+        ):
+            logger.warning(
+                "Forecast model artifacts are missing. "
+                "A baseline will be used until models are available."
+            )
+            return
 
-        logger.info("No cached forecasting models found. Will train dynamically on first request if needed.")
+        try:
+            models = joblib.load(models_path)
+            scalers = joblib.load(scalers_path)
 
-    def _build_inference_features(self, df: pd.DataFrame, city: str) -> Tuple[pd.DataFrame, pd.Series, Any]:
-        """
-        Builds the feature vector at issue time t for the given city using latest valid observations.
-        """
-        city_sub = df[df["city"].str.lower() == city.lower()].copy()
-        if len(city_sub) == 0:
+            with open(meta_path, "r", encoding="utf-8") as file:
+                metadata = json.load(file)
+
+            metrics = {}
+            if metrics_path.exists():
+                with open(metrics_path, "r", encoding="utf-8") as file:
+                    metrics = json.load(file)
+
+            if not isinstance(models, dict) or not isinstance(scalers, dict):
+                raise ValueError("Cached models and scalers must be dictionaries.")
+
+            self.models = models
+            self.scalers = scalers
+            self.feature_cols = metadata.get("feature_cols", [])
+            self.metrics = metrics
+
+            logger.info("Forecast model artifacts loaded successfully.")
+
+        except Exception:
+            logger.exception("Could not load cached forecasting artifacts.")
+            self.models = {}
+            self.scalers = {}
+            self.feature_cols = []
+            self.metrics = {}
+
+    @staticmethod
+    def _safe_float(value, default=0.0) -> float:
+        try:
+            result = float(value)
+            return result if np.isfinite(result) else float(default)
+        except (TypeError, ValueError):
+            return float(default)
+
+    @staticmethod
+    def _clamp_aqi(value: float) -> float:
+        return float(np.clip(value, 0.0, 500.0))
+
+    def _prepare_city_data(
+        self, df: pd.DataFrame, city: str
+    ) -> pd.DataFrame:
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            raise ValueError("AQI dataframe is empty or invalid.")
+
+        required = {"city", "date", self.target_col}
+        missing = required.difference(df.columns)
+        if missing:
+            raise ValueError(
+                f"Dataframe is missing required columns: {sorted(missing)}"
+            )
+
+        subset = df[
+            df["city"].astype(str).str.strip().str.lower()
+            == city.strip().lower()
+        ].copy()
+
+        if subset.empty:
             raise ValueError(f"No records available for city: {city}")
 
-        # Filter to rows with valid AQI to construct features
-        valid_sub = city_sub[city_sub["aqi"].notnull()].copy()
-        if len(valid_sub) < 8:
-            # If not enough valid AQI rows, use whatever rows exist
-            valid_sub = city_sub.copy()
-            valid_sub["aqi"] = valid_sub["aqi"].ffill().bfill().fillna(100.0)
+        subset["dt"] = pd.to_datetime(subset["date"], errors="coerce")
+        subset[self.target_col] = pd.to_numeric(
+            subset[self.target_col], errors="coerce"
+        )
+        subset = subset.dropna(subset=["dt", self.target_col])
 
-        valid_sub["dt"] = pd.to_datetime(valid_sub["date"])
-        valid_sub = valid_sub.sort_values(by="dt").reset_index(drop=True)
+        if subset.empty:
+            raise ValueError(f"No valid AQI records available for city: {city}")
 
-        latest_record = valid_sub.iloc[-1]
-        latest_date = latest_record["dt"].date()
+        for pollutant in self.POLLUTANTS:
+            if pollutant in subset.columns:
+                subset[pollutant] = pd.to_numeric(
+                    subset[pollutant], errors="coerce"
+                )
 
-        aqi_series = valid_sub["aqi"].astype(float)
-        pm25_series = valid_sub["pm25"].astype(float) if "pm25" in valid_sub else aqi_series * 0.45
+        # Aggregate multiple records for a date, if the input contains
+        # multiple monitoring stations for the same city and date.
+        aggregation = {self.target_col: "mean"}
+        for pollutant in self.POLLUTANTS:
+            if pollutant in subset.columns:
+                aggregation[pollutant] = "mean"
+        if "station_count" in subset.columns:
+            aggregation["station_count"] = "max"
 
-        # Feature row at latest time t
-        row_dict = {
-            "aqi_current": float(aqi_series.iloc[-1]),
-            "aqi_lag_1": float(aqi_series.iloc[-2]) if len(aqi_series) >= 2 else float(aqi_series.iloc[-1]),
-            "aqi_lag_2": float(aqi_series.iloc[-3]) if len(aqi_series) >= 3 else float(aqi_series.iloc[-1]),
-            "aqi_lag_3": float(aqi_series.iloc[-4]) if len(aqi_series) >= 4 else float(aqi_series.iloc[-1]),
-            "aqi_lag_7": float(aqi_series.iloc[-8]) if len(aqi_series) >= 8 else float(aqi_series.iloc[-1]),
-            "aqi_roll_mean_7": float(aqi_series.tail(7).mean()),
-            "aqi_roll_std_7": float(aqi_series.tail(7).std()) if len(aqi_series) >= 3 else 0.0,
-            "day_of_week": latest_date.weekday(),
-            "is_weekend": 1 if latest_date.weekday() >= 5 else 0,
-            "month": latest_date.month,
-            "day_of_year": latest_record["dt"].dayofyear,
+        subset["dt"] = subset["dt"].dt.normalize()
+        daily = (
+            subset.groupby("dt", as_index=False)
+            .agg(aggregation)
+            .sort_values("dt")
+            .reset_index(drop=True)
+        )
+        daily["city"] = city
+
+        return daily
+
+    def _build_features_from_prior(
+        self,
+        prior: pd.DataFrame,
+        target_dt: datetime,
+        all_cities: Optional[List[str]] = None,
+        city: Optional[str] = None,
+    ) -> pd.DataFrame:
+        """
+        Build one inference row using only observations before target_dt.
+        The target day's AQI is never included in its own features.
+        """
+        if prior.empty:
+            raise ValueError("Insufficient prior observations to build features.")
+
+        prior = prior.sort_values("dt").copy()
+        aqi = prior[self.target_col].astype(float)
+        current_date = pd.Timestamp(target_dt)
+
+        pm25 = (
+            prior["pm25"].astype(float).ffill()
+            if "pm25" in prior.columns
+            else aqi * 0.45
+        )
+        pm25 = pm25.fillna(aqi * 0.45)
+
+        row = {
+            "aqi_current": float(aqi.iloc[-1]),
+            "aqi_lag_1": float(aqi.iloc[-2]) if len(aqi) >= 2 else float(aqi.iloc[-1]),
+            "aqi_lag_2": float(aqi.iloc[-3]) if len(aqi) >= 3 else float(aqi.iloc[-1]),
+            "aqi_lag_3": float(aqi.iloc[-4]) if len(aqi) >= 4 else float(aqi.iloc[-1]),
+            "aqi_lag_7": float(aqi.iloc[-8]) if len(aqi) >= 8 else float(aqi.iloc[-1]),
+            "aqi_roll_mean_7": float(aqi.tail(7).mean()),
+            "aqi_roll_std_7": float(aqi.tail(7).std()) if len(aqi) >= 3 else 0.0,
+            "day_of_week": int(current_date.weekday()),
+            "is_weekend": int(current_date.weekday() >= 5),
+            "month": int(current_date.month),
+            "day_of_year": int(current_date.dayofyear),
         }
 
-        # Current pollutants
-        for p in ["pm25", "pm10", "no2", "so2", "co", "ozone"]:
-            if p in valid_sub:
-                row_dict[f"{p}_current"] = float(valid_sub[p].iloc[-1]) if pd.notnull(valid_sub[p].iloc[-1]) else 0.0
+        for pollutant in self.POLLUTANTS:
+            if pollutant in prior.columns:
+                values = prior[pollutant].astype(float).ffill()
+                value = values.iloc[-1]
+                row[f"{pollutant}_current"] = (
+                    float(value) if pd.notna(value) else 0.0
+                )
 
-        # Lags for PM2.5
-        for lag in [1, 2, 3, 7]:
-            idx = -(lag + 1)
-            row_dict[f"pm25_lag_{lag}"] = float(pm25_series.iloc[idx]) if len(pm25_series) >= abs(idx) else float(pm25_series.iloc[-1])
+        for lag in (1, 2, 3, 7):
+            position = -(lag + 1)
+            row[f"pm25_lag_{lag}"] = (
+                float(pm25.iloc[position])
+                if len(pm25) >= abs(position)
+                else float(pm25.iloc[-1])
+            )
 
-        # City one-hot features
-        all_cities = df["city"].dropna().unique().tolist()
-        for c in all_cities:
-            col_name = f"city_{c}"
-            row_dict[col_name] = 1.0 if c.lower() == city.lower() else 0.0
+        for name in all_cities or []:
+            row[f"city_{name}"] = float(
+                str(name).strip().lower() == str(city).strip().lower()
+            )
 
-        feat_df = pd.DataFrame([row_dict])
-        
-        # Align with trained feature columns
+        features = pd.DataFrame([row])
+
+        # The cached training metadata defines the model's expected order.
         if self.feature_cols:
-            for c in self.feature_cols:
-                if c not in feat_df.columns:
-                    feat_df[c] = 0.0
-            feat_df = feat_df[self.feature_cols]
+            for col in self.feature_cols:
+                if col not in features.columns:
+                    features[col] = 0.0
+            features = features[self.feature_cols]
 
-        return feat_df, latest_record, valid_sub
+        return (
+            features.replace([np.inf, -np.inf], np.nan)
+            .fillna(0.0)
+        )
+
+    def _predict_from_prior(
+        self,
+        prior: pd.DataFrame,
+        target_dt: datetime,
+        horizon: int = 1,
+        all_cities: Optional[List[str]] = None,
+        city: Optional[str] = None,
+    ) -> Tuple[float, str]:
+        """Predict from prior data; never use the target's observed AQI."""
+        features = self._build_features_from_prior(
+            prior=prior,
+            target_dt=target_dt,
+            all_cities=all_cities,
+            city=city,
+        )
+
+        model = self.models.get(horizon)
+        scaler = self.scalers.get(horizon)
+
+        if model is not None and scaler is not None:
+            try:
+                scaled = scaler.transform(features)
+                prediction = float(model.predict(scaled)[0])
+                if np.isfinite(prediction):
+                    return self._clamp_aqi(prediction), "ml_model"
+            except Exception:
+                logger.exception(
+                    "Model prediction failed for city=%s, horizon=%s",
+                    city,
+                    horizon,
+                )
+
+        # Honest fallback: calculate from prior AQI, not from the target row.
+        prior_aqi = prior[self.target_col].astype(float)
+        if prior_aqi.empty:
+            raise ValueError("No prior AQI values available for baseline prediction.")
+
+        baseline = float(prior_aqi.tail(7).mean())
+        return self._clamp_aqi(baseline), "rolling_mean_baseline"
+
+    def _get_horizon_metrics(self, horizon: int) -> Dict[str, Any]:
+        return self.metrics.get("horizons", {}).get(f"day_{horizon}", {})
+
+    def _confidence_interval(
+        self, prediction: float, rmse: float
+    ) -> Dict[str, Any]:
+        margin = 1.96 * max(0.0, float(rmse))
+        return {
+            "lower": max(0.0, round(prediction - margin, 1)),
+            "upper": min(500.0, round(prediction + margin, 1)),
+            "level": "95%",
+        }
 
     def generate_daily_forecast(
         self,
         df: pd.DataFrame,
         city: str,
         days: int = 5,
-        reference_date: Optional[str] = None
+        reference_date: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """
-        Generates daily forecasts automatically for the next five calendar days (Day 1: Tomorrow through Day 5).
-        - Forecast reference date is dynamically evaluated as Today's date in Asia/Kolkata timezone.
-        - Supports optional reference_date for simulation/testing.
-        - Day 1: Tomorrow, Day 2: Day after tomorrow, Day 3, Day 4, Day 5.
-        - Compares predicted AQI with the latest available actual observation (increase, decrease, or stable).
-        - Never hardcoded; dynamic timezone date handling.
-        """
+        """Generate a prediction for today and forecasts for subsequent days."""
         days = min(max(int(days), 1), 5)
 
-        # Check if models are loaded; if not, reload
         if not self.models:
             self._load_cached_models()
 
-        feat_df, latest_record, valid_sub = self._build_inference_features(df, city=city)
-
-        # 1. Today's reference date dynamically determined in Asia/Kolkata timezone
-        if reference_date:
-            today_date = pd.to_datetime(reference_date).date()
-        else:
-            today_date = get_current_kolkata_date()
-
-        # 2. Latest verified physical observation in dataset
-        latest_obs_date = pd.to_datetime(latest_record["date"]).date()
-        latest_aqi = round(float(latest_record["aqi"]), 1)
-        latest_cat = get_aqi_category_info(latest_aqi)
-        is_live = (latest_obs_date == today_date)
-
-        freshness_label = (
-            "Live Telemetry (Today)"
-            if is_live
-            else f"Latest verified CPCB physical monitoring observation: {latest_obs_date.strftime('%d %b %Y')}"
+        daily = self._prepare_city_data(df, city)
+        today = (
+            pd.to_datetime(reference_date).date()
+            if reference_date
+            else get_current_kolkata_date()
         )
+        all_cities = df["city"].dropna().astype(str).unique().tolist()
 
-        # Recent observed trajectory (last 5 actual recorded days)
-        recent_obs = []
-        recent_tail = valid_sub.tail(5)
-        for _, r in recent_tail.iterrows():
-            d_str = str(pd.to_datetime(r["date"]).date())
-            cat = get_aqi_category_info(r["aqi"])
-            recent_obs.append({
-                "date": d_str,
-                "observed_aqi": round(float(r["aqi"]), 1),
-                "category": cat["name"],
-                "color": cat["color"],
-                "is_prediction": False
-            })
-
-        baseline_recent_aqi = round(float(recent_tail["aqi"].mean()), 1)
-
-        # ---------------------------------------------------------------------
-        # Today's Model Prediction (evaluated strictly for today_date)
-        # ---------------------------------------------------------------------
-        today_model = self.models.get(1)
-        today_scaler = self.scalers.get(1)
-        today_rmse = self.metrics.get("horizons", {}).get("day_1", {}).get("test_rmse", 30.22)
-
-        today_feat = feat_df.copy()
-        today_feat["day_of_week"] = today_date.weekday()
-        today_feat["is_weekend"] = 1.0 if today_date.weekday() >= 5 else 0.0
-        today_feat["month"] = float(today_date.month)
-        today_feat["day_of_year"] = float(today_date.timetuple().tm_yday)
-
-        if today_model is not None and today_scaler is not None:
-            today_pred_raw = float(today_model.predict(today_scaler.transform(today_feat))[0])
+        # Use only observations strictly before the forecast date.
+        prior_today = daily[daily["dt"].dt.date < today].copy()
+        if prior_today.empty:
+            # No past observations means a valid model prediction is impossible.
+            # Use the earliest known observation as a clearly labelled fallback.
+            prior_today = daily.iloc[:1].copy()
+            today_source = "unavailable_insufficient_history"
+            today_raw = self._safe_float(prior_today[self.target_col].iloc[-1], 100.0)
         else:
-            today_pred_raw = float(valid_sub["aqi"].tail(7).mean())
+            today_raw, today_source = self._predict_from_prior(
+                prior_today,
+                pd.Timestamp(today),
+                horizon=1,
+                all_cities=all_cities,
+                city=city,
+            )
 
-        today_pred_raw = max(15.0, min(today_pred_raw, 495.0))
-        today_pred_aqi = round(today_pred_raw, 1)
-        today_margin = 1.96 * today_rmse
-        today_lower = max(10.0, round(today_pred_raw - today_margin, 1))
-        today_upper = min(500.0, round(today_pred_raw + today_margin, 1))
-        today_cat = get_aqi_category_info(today_pred_aqi)
-
-        if today_pred_aqi > 300:
-            today_health = "Very poor air quality expected today: avoid strenuous outdoor activities; stay indoors if vulnerable."
-        elif today_pred_aqi > 200:
-            today_health = "Unhealthy air quality today: sensitive groups should avoid prolonged outdoor exertion; consider wearing N95."
-        elif today_pred_aqi > 100:
-            today_health = "Moderate air quality today: sensitive individuals should pace strenuous outdoor activities."
-        elif today_pred_aqi > 50:
-            today_health = "Satisfactory air quality today: minor discomfort possible only for unusually sensitive groups."
-        else:
-            today_health = "Good air quality today: minimal impact; ideal for outdoor activities."
+        today_pred = round(self._clamp_aqi(today_raw), 1)
+        today_cat = get_aqi_category_info(today_pred)
+        today_metrics = self._get_horizon_metrics(1)
+        today_rmse = self._safe_float(today_metrics.get("test_rmse"), 30.22)
 
         today_prediction = {
-            "date": str(today_date),
-            "date_formatted": today_date.strftime("%d %B %Y"),
-            "display_label": today_date.strftime("%a, %d %b %Y"),
-            "predicted_aqi": today_pred_aqi,
+            "date": str(today),
+            "date_formatted": today.strftime("%d %B %Y"),
+            "display_label": today.strftime("%a, %d %b %Y"),
+            "predicted_aqi": today_pred,
             "category": today_cat["name"],
             "color": today_cat["color"],
             "badge": today_cat["badge"],
-            "confidence_interval": {
-                "lower": today_lower,
-                "upper": today_upper,
-                "level": "95%"
-            },
-            "health_advisory": today_health
+            "prediction_source": today_source,
+            "confidence_interval": self._confidence_interval(today_pred, today_rmse),
+            "health_advisory": self._health_advisory(today_pred),
         }
 
-        # ---------------------------------------------------------------------
-        # Future Forecast Horizon: Next 5 calendar days starting Tomorrow (Day 1 - Day 5)
-        # ---------------------------------------------------------------------
-        forecasts = []
-        prev_pred = today_pred_aqi
+        # Recent actual observations are context only.
+        recent_observed = []
+        for _, row in daily.tail(5).iterrows():
+            value = round(float(row[self.target_col]), 1)
+            category = get_aqi_category_info(value)
+            recent_observed.append({
+                "date": str(row["dt"].date()),
+                "observed_aqi": value,
+                "category": category["name"],
+                "color": category["color"],
+                "is_prediction": False,
+            })
 
-        horizon_titles = {
+        latest = daily.iloc[-1]
+        latest_aqi = round(float(latest[self.target_col]), 1)
+        latest_date = latest["dt"].date()
+        forecasts = []
+        previous_prediction = today_pred
+
+        titles = {
             1: "Day 1: Tomorrow",
             2: "Day 2: Day after tomorrow",
             3: "Day 3",
             4: "Day 4",
-            5: "Day 5"
+            5: "Day 5",
         }
 
-        for h in range(1, days + 1):
-            # Calendar day starting from tomorrow (excluding today)
-            future_date = today_date + pd.Timedelta(days=h)
-            f_date_str = str(future_date)
-            f_date_formatted = future_date.strftime("%d %B %Y")  # e.g. "21 October 2026"
-            f_display_label = future_date.strftime("%d %b %Y")   # e.g. "21 Oct 2026"
+        for horizon in range(1, days + 1):
+            future_date = pd.Timestamp(today) + pd.Timedelta(days=horizon)
+            # For each future date, only use observations before that date.
+            prior = daily[daily["dt"] < future_date].copy()
 
-            model = self.models.get(h)
-            scaler = self.scalers.get(h)
-            h_metrics = self.metrics.get("horizons", {}).get(f"day_{h}", {})
-            rmse_val = h_metrics.get("test_rmse", 30.0 + h * 4.0)
+            if prior.empty:
+                prior = daily.iloc[:1].copy()
 
-            # Build feature vector tailored to future calendar position
-            h_feat = feat_df.copy()
-            h_feat["day_of_week"] = future_date.weekday()
-            h_feat["is_weekend"] = 1.0 if future_date.weekday() >= 5 else 0.0
-            h_feat["month"] = float(future_date.month)
-            h_feat["day_of_year"] = float(future_date.timetuple().tm_yday)
+            prediction, source = self._predict_from_prior(
+                prior,
+                future_date,
+                horizon=horizon,
+                all_cities=all_cities,
+                city=city,
+            )
+            prediction = round(self._clamp_aqi(prediction), 1)
 
-            if model is not None and scaler is not None:
-                X_scaled = scaler.transform(h_feat)
-                pred_val = float(model.predict(X_scaled)[0])
+            metrics = self._get_horizon_metrics(horizon)
+            rmse = self._safe_float(
+                metrics.get("test_rmse"), 30.0 + horizon * 4.0
+            )
+            category = get_aqi_category_info(prediction)
+            delta = round(prediction - latest_aqi, 1)
+            step_delta = prediction - previous_prediction
+
+            if delta > 5:
+                comparison, comparison_label, comparison_color = (
+                    "increase",
+                    f"Higher than latest observation (+{delta} AQI points)",
+                    "#ef4444",
+                )
+            elif delta < -5:
+                comparison, comparison_label, comparison_color = (
+                    "decrease",
+                    f"Lower than latest observation ({delta} AQI points)",
+                    "#10b981",
+                )
             else:
-                # Heuristic dampening toward rolling mean if model not cached
-                roll_mean = float(valid_sub["aqi"].tail(7).mean())
-                decay = 0.85 ** h
-                pred_val = latest_aqi * decay + roll_mean * (1.0 - decay)
+                comparison, comparison_label, comparison_color = (
+                    "stable",
+                    "Approximately stable compared with latest observation",
+                    "#64748b",
+                )
 
-            # Keep prediction within physical bounds
-            pred_val = max(15.0, min(pred_val, 495.0))
-            pred_round = round(pred_val, 1)
-
-            # Calibrated 95% uncertainty interval: +/- 1.96 * RMSE_h
-            margin = 1.96 * rmse_val
-            lower_bound = max(10.0, round(pred_val - margin, 1))
-            upper_bound = min(500.0, round(pred_val + margin, 1))
-
-            pred_cat = get_aqi_category_info(pred_round)
-
-            # Comparison with latest available actual AQI
-            delta_from_actual = round(pred_round - latest_aqi, 1)
-            if delta_from_actual > 5.0:
-                comp_actual = "increase"
-                comp_label = f"Higher pollution expected (+{delta_from_actual} pts vs historical baseline)"
-                comp_color = "#ef4444"
-            elif delta_from_actual < -5.0:
-                comp_actual = "decrease"
-                comp_label = f"Lower pollution expected ({delta_from_actual} pts vs historical baseline)"
-                comp_color = "#10b981"
-            else:
-                comp_actual = "stable"
-                comp_label = "Pollution expected to remain approximately stable (+/- 5 pts vs baseline)"
-                comp_color = "#64748b"
-
-            # Trend relative to previous step
-            diff_step = pred_round - prev_pred
-            if diff_step > 5:
-                trend_dir = "deteriorating"
-            elif diff_step < -5:
-                trend_dir = "improving"
-            else:
-                trend_dir = "stable"
-
-            # Tailored recommendations based on predicted category
-            if pred_round > 300:
-                health_advisory = "Very Poor air quality predicted. Limit outdoor physical exertion; vulnerable groups should stay indoors."
-            elif pred_round > 200:
-                health_advisory = "Poor air quality predicted. Sensitive groups should wear protective filtration masks (N95) near traffic corridors."
-            elif pred_round > 100:
-                health_advisory = "Moderate air quality predicted. Sensitive individuals should pace heavy outdoor activities."
-            elif pred_round > 50:
-                health_advisory = "Satisfactory air quality predicted. Minor breathing discomfort possible only for unusually sensitive individuals."
-            else:
-                health_advisory = "Good air quality predicted. Minimal health impact; optimal for outdoor sports and ventilation."
+            trend = (
+                "deteriorating" if step_delta > 5
+                else "improving" if step_delta < -5
+                else "stable"
+            )
 
             forecasts.append({
-                "step": h,
-                "horizon_label": horizon_titles.get(h, f"Day +{h}"),
-                "horizon_title": horizon_titles.get(h, f"Day +{h}"),
-                "date": f_date_str,
-                "date_formatted": f_date_formatted,
-                "display_label": f_display_label,
-                "predicted_aqi": pred_round,
-                "category": pred_cat["name"],
-                "color": pred_cat["color"],
-                "badge": pred_cat["badge"],
-                "health_advisory": health_advisory,
-                "trend_direction": trend_dir,
-                "comparison_to_actual": comp_actual,
-                "delta_from_actual": delta_from_actual,
-                "comparison_label": comp_label,
-                "comparison_color": comp_color,
+                "step": horizon,
+                "horizon_label": titles[horizon],
+                "horizon_title": titles[horizon],
+                "date": str(future_date.date()),
+                "date_formatted": future_date.strftime("%d %B %Y"),
+                "display_label": future_date.strftime("%d %b %Y"),
+                "predicted_aqi": prediction,
+                "category": category["name"],
+                "color": category["color"],
+                "badge": category["badge"],
+                "health_advisory": self._health_advisory(prediction),
+                "trend_direction": trend,
+                "comparison_to_actual": comparison,
+                "delta_from_actual": delta,
+                "comparison_label": comparison_label,
+                "comparison_color": comparison_color,
+                "prediction_source": source,
                 "is_prediction": True,
-                "confidence_interval": {
-                    "lower": lower_bound,
-                    "upper": upper_bound,
-                    "level": "95%"
-                }
+                "confidence_interval": self._confidence_interval(prediction, rmse),
             })
-            prev_pred = pred_round
+            previous_prediction = prediction
 
-        # Overall trend assessment over the requested horizon
         final_aqi = forecasts[-1]["predicted_aqi"]
         total_delta = round(final_aqi - latest_aqi, 1)
+
         if total_delta > 10:
-            overall_trend = f"Pollution levels are expected to increase over the 5-day horizon (+{total_delta} pts vs baseline)."
+            overall_trend = (
+                f"Pollution may increase over the requested horizon "
+                f"(+{total_delta} AQI points versus the latest observation)."
+            )
             trend_tone = "warning"
         elif total_delta < -10:
-            overall_trend = f"Pollution levels are expected to decrease over the 5-day horizon ({total_delta} pts vs baseline)."
+            overall_trend = (
+                f"Pollution may decrease over the requested horizon "
+                f"({total_delta} AQI points versus the latest observation)."
+            )
             trend_tone = "positive"
         else:
-            overall_trend = "Pollution levels are expected to remain approximately stable over the next five days (within ±10 pts)."
+            overall_trend = "Pollution is projected to remain approximately stable."
             trend_tone = "neutral"
 
-        # Actionable recommendations
-        observed_recs = []
-        if latest_aqi > 200:
-            observed_recs.append(f"Historical telemetry ({latest_obs_date.strftime('%d %b %Y')}) indicates elevated particulate matter. Limit prolonged outdoor exertion.")
-        elif latest_aqi > 100:
-            observed_recs.append(f"Historical telemetry ({latest_obs_date.strftime('%d %b %Y')}) indicates moderate air quality. Sensitive individuals should monitor respiratory comfort.")
-        else:
-            observed_recs.append(f"Historical telemetry ({latest_obs_date.strftime('%d %b %Y')}) indicates satisfactory air quality meeting national safety benchmarks.")
+        observed_recs = [
+            f"Latest dataset observation: AQI {latest_aqi} on "
+            f"{latest_date.strftime('%d %b %Y')}."
+        ]
+        peak_prediction = max(x["predicted_aqi"] for x in forecasts)
+        predicted_recs = [self._health_advisory(peak_prediction)]
 
-        predicted_recs = []
-        peak_pred = max(f["predicted_aqi"] for f in forecasts)
-        if peak_pred > 200:
-            predicted_recs.append("Predicted higher pollution days ahead: plan indoor activities and consider protective filtration masks.")
-        elif peak_pred > 100:
-            predicted_recs.append("Predicted moderate pollution: sensitive individuals should avoid strenuous outdoor exercise during rush hours.")
-        else:
-            predicted_recs.append("Favorable atmospheric conditions predicted: good dispersion suitable for outdoor exercise.")
-
-        if total_delta > 10:
-            predicted_recs.append("Worsening trend projected: prepare for gradual atmospheric accumulation over the coming days.")
-        elif total_delta < -10:
-            predicted_recs.append("Improving trend projected: increasing atmospheric ventilation is expected to disperse particulates.")
-
-        combined_recs = observed_recs + predicted_recs
-
-        h1_metrics = self.metrics.get("horizons", {}).get("day_1", {})
-
-        alerts_result = self.detect_high_pollution_alerts(
+        alerts = self.detect_high_pollution_alerts(
             city=city,
             latest_obs_aqi=latest_aqi,
-            latest_obs_date=latest_obs_date.strftime("%d %b %Y"),
+            latest_obs_date=latest_date.strftime("%d %b %Y"),
             today_prediction=today_prediction,
             forecast_steps=forecasts,
-            threshold=200.0
+            threshold=200.0,
         )
 
         return {
             "city": city,
-            "today_date": str(today_date),
-            "today_formatted": today_date.strftime("%d %b %Y"),
+            "today_date": str(today),
+            "today_formatted": today.strftime("%d %b %Y"),
             "today_prediction": today_prediction,
-            "forecast_reference_date": str(today_date),
-            "forecast_reference_formatted": today_date.strftime("%d %B %Y"),
-            "latest_observed_date": latest_obs_date.strftime("%d %b %Y"),
+            "forecast_reference_date": str(today),
+            "forecast_reference_formatted": today.strftime("%d %B %Y"),
+            "latest_observed_date": latest_date.strftime("%d %b %Y"),
             "latest_observed_aqi": latest_aqi,
-            "latest_observed_category": latest_cat["name"],
-            "is_live_observation": False,
-            "freshness_label": f"Verified Historical CPCB Observation ({latest_obs_date.strftime('%d %b %Y')})",
+            "latest_observed_category": get_aqi_category_info(latest_aqi)["name"],
+            "is_live_observation": latest_date == today,
+            "freshness_label": (
+                "Observation dated today"
+                if latest_date == today
+                else f"Latest dataset observation: {latest_date.strftime('%d %b %Y')}"
+            ),
             "requested_horizon_days": days,
-            "recent_observed": recent_obs,
+            "recent_observed": recent_observed,
             "forecast": forecasts,
-            "alerts": alerts_result,
+            "alerts": alerts,
             "overall_trend": overall_trend,
             "trend_tone": trend_tone,
             "delta_from_latest": total_delta,
-            "baseline_recent_aqi": baseline_recent_aqi,
+            "baseline_recent_aqi": round(float(daily.tail(7)[self.target_col].mean()), 1),
             "observed_recommendations": observed_recs,
             "predicted_recommendations": predicted_recs,
-            "recommendations": combined_recs,
+            "recommendations": observed_recs + predicted_recs,
             "model_metadata": {
-                "validation_approach": "Direct multi-horizon regression on chronological partitions with zero target leakage",
-                "day_1_test_mae": h1_metrics.get("test_mae", 19.93),
-                "day_1_test_r2": h1_metrics.get("test_r2", 0.8667),
-                "data_provenance": "CPCB CAAQM Network historical measurements"
-            }
+                "validation_approach": (
+                    "Prior-only features; cached model metrics are reported separately"
+                ),
+                "day_1_test_mae": today_metrics.get("test_mae"),
+                "day_1_test_r2": today_metrics.get("test_r2"),
+                "data_provenance": "Source dataset supplied to ForecastEngine",
+                "today_prediction_source": today_source,
+            },
         }
+
+    @staticmethod
+    def _health_advisory(aqi: float) -> str:
+        if aqi > 300:
+            return (
+                "Very poor air quality: avoid strenuous outdoor activity; "
+                "vulnerable people should remain indoors."
+            )
+        if aqi > 200:
+            return (
+                "Poor air quality: sensitive groups should reduce prolonged "
+                "outdoor exertion and consider a well-fitting N95 mask."
+            )
+        if aqi > 100:
+            return (
+                "Moderate air quality: sensitive individuals should limit "
+                "strenuous outdoor activity if symptoms occur."
+            )
+        if aqi > 50:
+            return "Satisfactory air quality; unusually sensitive people may experience discomfort."
+        return "Good air quality; minimal health impact is expected."
 
     def detect_high_pollution_alerts(
         self,
@@ -432,341 +538,290 @@ class ForecastEngine:
         latest_obs_date: Optional[str],
         today_prediction: Dict[str, Any],
         forecast_steps: List[Dict[str, Any]],
-        threshold: float = 200.0
+        threshold: float = 200.0,
     ) -> Dict[str, Any]:
-        """
-        Detects High Pollution Alerts based on CPCB NAQI standard.
-        Threshold: 200 represents CPCB 'Poor' (Unhealthy).
-        Distinguishes:
-        - Current Pollution Alert (from genuine measured observation)
-        - Forecast Pollution Alert (from valid model prediction for today or upcoming forecast days)
-        Avoids duplicate alerts for the same event and city.
-        """
+        """Build distinct current-observation and forecast pollution alerts."""
         alerts = []
         seen_ids = set()
 
-        # 1. Check genuine measured observation (Current Pollution Alert)
-        if latest_obs_aqi is not None and latest_obs_aqi >= threshold:
-            alert_id = f"current-{city.lower()}-{latest_obs_date}"
-            if alert_id not in seen_ids:
-                seen_ids.add(alert_id)
-                cat_info = get_aqi_category_info(latest_obs_aqi)
-                alerts.append({
-                    "id": alert_id,
-                    "city": city,
-                    "alert_type": "current",
-                    "alert_type_label": "Current Pollution Alert",
-                    "severity": cat_info["name"],
-                    "color": cat_info["color"],
-                    "badge": cat_info["badge"],
-                    "aqi_value": latest_obs_aqi,
-                    "is_prediction": False,
-                    "timestamp": f"{latest_obs_date} (Physical Measurement)",
-                    "expected_impact": "Active / Observed",
-                    "status": "Active",
-                    "headline": f"Unhealthy Air Quality Measured in {city}",
-                    "description": f"Observed AQI of {latest_obs_aqi} ({cat_info['name']}) crosses the health threshold of {int(threshold)} CPCB points.",
-                    "precautions": [
-                        "Sensitive individuals (children, elderly, asthmatics) should avoid prolonged outdoor exertion.",
-                        "Wear an N95 respirator mask near heavy traffic or construction zones.",
-                        "Keep windows closed and utilize indoor air filtration if available."
-                    ]
-                })
+        def add_alert(
+            alert_id: str,
+            alert_type: str,
+            aqi_value: float,
+            timestamp: str,
+            expected_impact: str,
+            headline: str,
+            description: str,
+            precautions: List[str],
+            is_prediction: bool,
+        ):
+            if alert_id in seen_ids:
+                return
 
-        # 2. Check Today's Model Prediction (Forecast Pollution Alert - Today)
+            seen_ids.add(alert_id)
+            category = get_aqi_category_info(aqi_value)
+            alerts.append({
+                "id": alert_id,
+                "city": city,
+                "alert_type": alert_type,
+                "alert_type_label": (
+                    "Current Pollution Alert"
+                    if alert_type == "current"
+                    else "Forecast Pollution Alert"
+                ),
+                "severity": category["name"],
+                "color": category["color"],
+                "badge": category["badge"],
+                "aqi_value": round(float(aqi_value), 1),
+                "is_prediction": is_prediction,
+                "timestamp": timestamp,
+                "expected_impact": expected_impact,
+                "status": "Active",
+                "headline": headline,
+                "description": description,
+                "precautions": precautions,
+            })
+
+        if latest_obs_aqi is not None and latest_obs_aqi >= threshold:
+            add_alert(
+                f"current-{city.lower()}-{latest_obs_date}",
+                "current",
+                latest_obs_aqi,
+                f"{latest_obs_date} (dataset observation)",
+                "Observed",
+                f"High AQI Observation in {city}",
+                f"Observed AQI {latest_obs_aqi} meets or exceeds threshold {threshold}.",
+                [
+                    "Reduce prolonged outdoor exertion.",
+                    "Sensitive groups should take extra precautions.",
+                    "Follow local public-health advice.",
+                ],
+                False,
+            )
+
         today_aqi = today_prediction.get("predicted_aqi")
         if today_aqi is not None and today_aqi >= threshold:
-            today_date = today_prediction.get("date", "today")
-            alert_id = f"forecast-{city.lower()}-{today_date}"
-            if alert_id not in seen_ids:
-                seen_ids.add(alert_id)
-                today_cat = get_aqi_category_info(today_aqi)
-                alerts.append({
-                    "id": alert_id,
-                    "city": city,
-                    "alert_type": "forecast",
-                    "alert_type_label": "Forecast Pollution Alert",
-                    "severity": today_cat["name"],
-                    "color": today_cat["color"],
-                    "badge": today_cat["badge"],
-                    "aqi_value": today_aqi,
-                    "is_prediction": True,
-                    "timestamp": f"Issued for Today ({today_prediction.get('display_label', today_date)})",
-                    "expected_impact": f"Today ({today_prediction.get('display_label', today_date)})",
-                    "status": "Active",
-                    "headline": f"High Pollution Forecast for Today in {city}",
-                    "description": f"Our predictive model forecasts an AQI of {today_aqi} ({today_cat['name']}) for today.",
-                    "precautions": [
-                        "Plan outdoor physical activities during lower traffic hours.",
-                        "Vulnerable groups should reduce heavy outdoor exercise.",
-                        "Consider air purification and closed ventilation."
-                    ]
-                })
+            date = today_prediction.get("date", "today")
+            add_alert(
+                f"forecast-{city.lower()}-{date}",
+                "forecast",
+                today_aqi,
+                f"Issued for {date}",
+                f"Today ({date})",
+                f"High Pollution Forecast for {city}",
+                f"The model forecasts AQI {today_aqi} for {date}.",
+                [
+                    "Consider moving strenuous outdoor activities indoors.",
+                    "Sensitive groups should reduce heavy outdoor exertion.",
+                ],
+                True,
+            )
 
-        # 3. Check upcoming days in the 5-day forecast
-        high_forecast_steps = [s for s in forecast_steps if s.get("predicted_aqi", 0) >= threshold]
-        for step in high_forecast_steps[:2]:
-            alert_id = f"forecast-{city.lower()}-{step['date']}"
-            if alert_id not in seen_ids:
-                seen_ids.add(alert_id)
-                s_cat = get_aqi_category_info(step["predicted_aqi"])
-                alerts.append({
-                    "id": alert_id,
-                    "city": city,
-                    "alert_type": "forecast",
-                    "alert_type_label": "Forecast Pollution Alert",
-                    "severity": s_cat["name"],
-                    "color": s_cat["color"],
-                    "badge": s_cat["badge"],
-                    "aqi_value": step["predicted_aqi"],
-                    "is_prediction": True,
-                    "timestamp": "Multi-Horizon Model Outlook",
-                    "expected_impact": f"{step['horizon_title']} ({step['date_formatted']})",
-                    "status": "Active",
-                    "headline": f"Elevated Pollution Expected on {step['date_formatted']} in {city}",
-                    "description": f"Model forecast predicts AQI of {step['predicted_aqi']} ({s_cat['name']}) on {step['date_formatted']}.",
-                    "precautions": [
-                        "Anticipate unhealthy air quality on this upcoming forecast date.",
-                        "Reschedule strenuous outdoor sports or events if feasible."
-                    ]
-                })
+        for step in forecast_steps:
+            if step.get("predicted_aqi", 0) < threshold:
+                continue
 
-        has_alerts = len(alerts) > 0
-        summary_msg = (
-            f"{len(alerts)} high pollution alert(s) currently active for {city} exceeding AQI {int(threshold)}."
-            if has_alerts else
-            f"No active high pollution alerts for {city}. Air quality remains within acceptable thresholds (<{int(threshold)} AQI)."
+            date = step.get("date", "unknown")
+            add_alert(
+                f"forecast-{city.lower()}-{date}",
+                "forecast",
+                step["predicted_aqi"],
+                "Forecast model output",
+                f"{step.get('horizon_title', 'Upcoming day')} ({step.get('date_formatted', date)})",
+                f"Elevated Pollution Expected in {city}",
+                f"The forecast estimates AQI {step['predicted_aqi']} for {date}.",
+                [
+                    "Consider reducing strenuous outdoor activities.",
+                    "Sensitive groups should monitor official air-quality guidance.",
+                ],
+                True,
+            )
+
+        count = len(alerts)
+        summary = (
+            f"{count} high-pollution alert(s) for {city} at or above AQI {threshold}."
+            if count
+            else f"No alerts at or above AQI {threshold} were identified for {city}."
         )
 
         return {
             "city": city,
             "threshold": threshold,
-            "has_alerts": has_alerts,
-            "summary": summary_msg,
+            "has_alerts": count > 0,
+            "summary": summary,
             "alerts": alerts,
-            "count": len(alerts)
+            "count": count,
         }
 
     def generate_live_vs_prediction_comparison(
         self,
         df: pd.DataFrame,
         city: str,
-        reference_date: Optional[str] = None
+        reference_date: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
-        Compares verified actual observed AQI with our ML model's prediction for the same city and date.
-        
-        Strict Data Freshness & Methodology Rules:
-        1. Live Observation:
-           - Fetched directly from external live telemetry (Open-Meteo Air Quality API with CPCB linear sub-indices).
-           - Strictly checks if the observation timestamp corresponds to the current calendar day in Asia/Kolkata timezone.
-           - If no observation exists for today, clearly reports that today's live reading is unavailable,
-             and separately identifies the most recent historical observation with its actual date.
-           - Stale or historical data is NEVER presented as current live data.
-        2. ML Model Prediction:
-           - Evaluated strictly using historical inputs prior to observation date (zero future leakage).
-        3. Error Metrics: Absolute Difference |Pred - Obs|, Percentage Error, Category match.
-        4. Matched Historical Series for 14-day retrospective tracking.
+        Compare today's live observation against today's prediction.
+
+        Retrospective predictions use only observations preceding each target
+        date. Actual AQI is never copied into the prediction field.
         """
         if not self.models:
             self._load_cached_models()
 
-        city_sub = df[df["city"].str.lower() == city.lower()].copy()
-        if len(city_sub) == 0:
-            raise ValueError(f"No records available for city: {city}")
+        daily = self._prepare_city_data(df, city)
+        all_cities = df["city"].dropna().astype(str).unique().tolist()
 
-        valid_sub = city_sub[city_sub["aqi"].notnull()].copy()
-        if len(valid_sub) < 8:
-            valid_sub = city_sub.copy()
-            valid_sub["aqi"] = valid_sub["aqi"].ffill().bfill().fillna(100.0)
+        today = (
+            pd.to_datetime(reference_date).date()
+            if reference_date
+            else get_current_kolkata_date()
+        )
+        today_str = str(today)
 
-        valid_sub["dt"] = pd.to_datetime(valid_sub["date"])
-        valid_sub = valid_sub.sort_values(by="dt").reset_index(drop=True)
+        h1_metrics = self._get_horizon_metrics(1)
+        rmse = self._safe_float(h1_metrics.get("test_rmse"), 30.22)
 
-        if reference_date:
-            today_date = pd.to_datetime(reference_date).date()
+        prior_today = daily[daily["dt"].dt.date < today].copy()
+        if prior_today.empty:
+            today_prediction_value = float(daily.iloc[0][self.target_col])
+            prediction_source = "unavailable_insufficient_history"
         else:
-            today_date = get_current_kolkata_date()
+            today_prediction_value, prediction_source = self._predict_from_prior(
+                prior_today,
+                pd.Timestamp(today),
+                horizon=1,
+                all_cities=all_cities,
+                city=city,
+            )
 
-        today_str = str(today_date)
-        all_cities = df["city"].dropna().unique().tolist()
+        today_prediction_value = round(self._clamp_aqi(today_prediction_value), 1)
+        today_category = get_aqi_category_info(today_prediction_value)
+        ci = self._confidence_interval(today_prediction_value, rmse)
 
-        # Helper to extract features prior to a given index or issue point
-        def build_features_prior_to(idx: int, target_dt: Optional[datetime] = None) -> pd.DataFrame:
-            prior_df = valid_sub.iloc[:idx] if idx <= len(valid_sub) else valid_sub
-            if target_dt is not None:
-                t_dt = target_dt
-            else:
-                target_r = valid_sub.iloc[idx if idx < len(valid_sub) else -1]
-                t_dt = target_r["dt"]
+        latest = daily.iloc[-1]
+        latest_date = latest["dt"].date()
+        latest_date_str = str(latest_date)
+        latest_aqi = round(float(latest[self.target_col]), 1)
+        latest_category = get_aqi_category_info(latest_aqi)
+        latest_display = latest["dt"].strftime("%d %b %Y")
 
-            aqi_s = prior_df["aqi"].astype(float)
-            pm25_s = prior_df["pm25"].astype(float) if "pm25" in prior_df else aqi_s * 0.45
+        pollutants = {}
+        for pollutant in self.POLLUTANTS:
+            if pollutant in daily.columns and pd.notna(latest.get(pollutant)):
+                pollutants[pollutant] = round(
+                    float(latest[pollutant]),
+                    2 if pollutant == "co" else 1,
+                )
 
-            row = {
-                "aqi_current": float(aqi_s.iloc[-1]),
-                "aqi_lag_1": float(aqi_s.iloc[-2]) if len(aqi_s) >= 2 else float(aqi_s.iloc[-1]),
-                "aqi_lag_2": float(aqi_s.iloc[-3]) if len(aqi_s) >= 3 else float(aqi_s.iloc[-1]),
-                "aqi_lag_3": float(aqi_s.iloc[-4]) if len(aqi_s) >= 4 else float(aqi_s.iloc[-1]),
-                "aqi_lag_7": float(aqi_s.iloc[-8]) if len(aqi_s) >= 8 else float(aqi_s.iloc[-1]),
-                "aqi_roll_mean_7": float(aqi_s.tail(7).mean()),
-                "aqi_roll_std_7": float(aqi_s.tail(7).std()) if len(aqi_s) >= 3 else 0.0,
-                "day_of_week": t_dt.weekday(),
-                "is_weekend": 1 if t_dt.weekday() >= 5 else 0,
-                "month": t_dt.month,
-                "day_of_year": t_dt.dayofyear if hasattr(t_dt, 'dayofyear') else t_dt.timetuple().tm_yday,
-            }
-            for p in ["pm25", "pm10", "no2", "so2", "co", "ozone"]:
-                row[f"{p}_current"] = float(prior_df[p].iloc[-1]) if (p in prior_df and pd.notnull(prior_df[p].iloc[-1])) else 0.0
-            for lag in [1, 2, 3, 7]:
-                pos = -(lag + 1)
-                row[f"pm25_lag_{lag}"] = float(pm25_s.iloc[pos]) if len(pm25_s) >= abs(pos) else float(pm25_s.iloc[-1])
-            for c in all_cities:
-                row[f"city_{c}"] = 1.0 if c.lower() == city.lower() else 0.0
-
-            f_df = pd.DataFrame([row])
-            for c in self.feature_cols:
-                if c not in f_df:
-                    f_df[c] = 0.0
-            return f_df[self.feature_cols]
-
-        # 1. Attempt to fetch live observation for current calendar day
-        live_res = fetch_live_observation_for_city(city, reference_date=today_date)
-
-        model_1 = self.models.get(1)
-        scaler_1 = self.scalers.get(1)
-        h1_metrics = self.metrics.get("horizons", {}).get("day_1", {})
-        rmse_1 = h1_metrics.get("test_rmse", 30.22)
-
-        # 2. Always generate Today's Model Prediction for today_date
-        t_dt = pd.to_datetime(today_date)
-        feat_today = build_features_prior_to(len(valid_sub), target_dt=t_dt)
-        if model_1 is not None and scaler_1 is not None:
-            today_pred_raw = float(model_1.predict(scaler_1.transform(feat_today))[0])
-        else:
-            today_pred_raw = float(valid_sub["aqi"].tail(7).mean())
-
-        today_pred_raw = max(15.0, min(today_pred_raw, 495.0))
-        today_pred_aqi = round(today_pred_raw, 1)
-        today_cat_info = get_aqi_category_info(today_pred_aqi)
-        margin_1 = 1.96 * rmse_1
-        pred_ci_lower = max(10.0, round(today_pred_raw - margin_1, 1))
-        pred_ci_upper = min(500.0, round(today_pred_raw + margin_1, 1))
-
-        # Check latest historical observation in dataset for background context
-        latest_row = valid_sub.iloc[-1]
-        latest_date_str = str(latest_row["dt"].date())
-        hist_obs_aqi = round(float(latest_row["aqi"]), 1)
-        hist_cat_info = get_aqi_category_info(hist_obs_aqi)
-        hist_display_date = latest_row["dt"].strftime("%d %b %Y")
-        hist_timestamp = f"{hist_display_date}, Verified Historical CPCB Telemetry"
-        station_count = int(latest_row.get("station_count", 1)) if pd.notnull(latest_row.get("station_count")) else 1
-
-        pollutants_map = {}
-        for p in ["pm25", "pm10", "no2", "so2", "co", "ozone"]:
-            if p in latest_row and pd.notnull(latest_row[p]):
-                pollutants_map[p] = round(float(latest_row[p]), 2 if p == "co" else 1)
-
-        historical_baseline_record = {
-            "aqi": hist_obs_aqi,
-            "category": hist_cat_info["name"],
-            "color": hist_cat_info["color"],
-            "badge": hist_cat_info["badge"],
+        historical_record = {
+            "aqi": latest_aqi,
+            "category": latest_category["name"],
+            "color": latest_category["color"],
+            "badge": latest_category["badge"],
             "date": latest_date_str,
-            "display_date": hist_display_date,
-            "timestamp": hist_timestamp,
-            "data_source": "Central Pollution Control Board (CPCB) Verified Historical Telemetry",
-            "station_count": station_count,
-            "pollutants": pollutants_map,
-            "is_historical": True
+            "display_date": latest_display,
+            "timestamp": f"{latest_display}, Historical Dataset Observation",
+            "data_source": "Historical AQI dataset",
+            "station_count": int(latest.get("station_count", 1) or 1),
+            "pollutants": pollutants,
+            "is_historical": True,
         }
 
-        if live_res.get("today_live_available"):
-            # Live observation for today is genuine & available
-            is_live = True
-            today_live_available = True
-            live_aqi = round(float(live_res["aqi"]), 1)
-            live_cat_info = get_aqi_category_info(live_aqi)
-            live_date_str = live_res["observation_date"]
-            live_display_date = live_res["observation_display_date"]
-            live_timestamp = live_res["observation_timestamp"]
-            data_source = live_res["data_source"]
-            freshness_status = "Live Telemetry (Today)"
-            freshness_note = live_res["freshness_note"]
-            warning_message = None
-            live_pollutants = live_res.get("pollutants", {})
-            station_count = live_res.get("station_count", 4)
+        try:
+            live_result = fetch_live_observation_for_city(
+                city, reference_date=today
+            ) or {}
+        except Exception as exc:
+            logger.warning("Live observation lookup failed for %s: %s", city, exc)
+            live_result = {
+                "today_live_available": False,
+                "warning_message": "Live AQI service is temporarily unavailable.",
+            }
 
-            # Direct comparison between Today's Live and Today's Prediction
-            abs_diff = round(abs(today_pred_aqi - live_aqi), 1)
-            pct_err = round((abs_diff / live_aqi) * 100.0, 1) if live_aqi > 0 else None
-            cat_match = (live_cat_info["name"].lower() == today_cat_info["name"].lower())
+        live_available = bool(
+            live_result.get("today_live_available")
+            and live_result.get("aqi") is not None
+        )
 
-            categories_order = [c["name"].lower() for c in AQI_CATEGORIES]
-            try:
-                live_rank = categories_order.index(live_cat_info["name"].lower())
-                pred_rank = categories_order.index(today_cat_info["name"].lower())
-                rank_diff = abs(live_rank - pred_rank)
-            except Exception:
-                rank_diff = 0
-
-            if cat_match:
-                match_status = "Exact Category Match"
-                match_tone = "positive"
-            elif rank_diff == 1:
-                match_status = "Adjacent Category (Within 1 Band)"
-                match_tone = "neutral"
-            else:
-                match_status = "Discrepant Category"
-                match_tone = "warning"
-
-            comparison_available = True
-            eval_text = (
-                f"Our model estimated an AQI of {today_pred_aqi} ({today_cat_info['name']}) for today ({today_date.strftime('%d %b %Y')}), "
-                f"compared to the verified live observed AQI of {live_aqi} ({live_cat_info['name']}), yielding an absolute difference of {abs_diff} AQI points."
+        if live_available:
+            live_aqi = round(float(live_result["aqi"]), 1)
+            live_category = get_aqi_category_info(live_aqi)
+            live_display = live_result.get(
+                "observation_display_date", today.strftime("%d %b %Y")
             )
+            live_timestamp = live_result.get(
+                "observation_timestamp", live_display
+            )
+            data_source = live_result.get(
+                "data_source", "External live AQI service"
+            )
+            freshness_status = "Live Telemetry (Today)"
+            freshness_note = live_result.get("freshness_note", "")
+            warning = None
 
             observed_payload = {
                 "aqi": live_aqi,
                 "is_available": True,
-                "category": live_cat_info["name"],
-                "color": live_cat_info["color"],
-                "badge": live_cat_info["badge"],
-                "pollutants": live_pollutants,
+                "category": live_category["name"],
+                "color": live_category["color"],
+                "badge": live_category["badge"],
+                "pollutants": live_result.get("pollutants", {}),
                 "timestamp": live_timestamp,
-                "display_date": live_display_date,
+                "display_date": live_display,
                 "data_source": data_source,
-                "is_live": True
+                "is_live": True,
             }
 
-        else:
-            # Genuine current observation for today is UNAVAILABLE
-            is_live = False
-            today_live_available = False
-            live_aqi = None
-            live_date_str = str(today_date)
-            live_display_date = f"Today ({today_date.strftime('%d %b %Y')})"
-            live_timestamp = f"Live telemetry unavailable for today ({today_date.strftime('%d %b %Y')})"
-            data_source = "External Monitoring Station Telemetry"
-            freshness_status = "Live Telemetry Unavailable for Today"
-            freshness_note = f"Genuine live observation for today ({today_date.strftime('%d %b %Y')}) is currently unavailable from monitoring station telemetry."
-            warning_message = (
-                live_res.get("warning_message") or
-                f"Live telemetry for today ({today_date.strftime('%d %b %Y')}) is currently unavailable. "
-                f"Today's model prediction is presented below alongside the latest verified historical telemetry baseline ({hist_display_date})."
+            absolute_difference = round(
+                abs(today_prediction_value - live_aqi), 1
+            )
+            percentage_error = (
+                round(absolute_difference / abs(live_aqi) * 100, 1)
+                if live_aqi != 0
+                else None
+            )
+            category_match = (
+                live_category["name"].lower()
+                == today_category["name"].lower()
             )
 
-            abs_diff = None
-            pct_err = None
-            cat_match = None
-            rank_diff = None
-            match_status = "Live Observation Pending"
-            match_tone = "neutral"
-            comparison_available = False
-            eval_text = (
-                f"Direct live-vs-prediction comparison is pending because real-time station telemetry for today ({today_date.strftime('%d %b %Y')}) has not yet been reported. "
-                f"Today's model prediction ({today_pred_aqi}) is shown above. Model accuracy is evaluated below on matching historical actual-versus-predicted records."
+            category_order = [x["name"].lower() for x in AQI_CATEGORIES]
+            try:
+                rank_difference = abs(
+                    category_order.index(live_category["name"].lower())
+                    - category_order.index(today_category["name"].lower())
+                )
+            except ValueError:
+                rank_difference = None
+
+            if category_match:
+                match_status, match_tone = "Exact Category Match", "positive"
+            elif rank_difference == 1:
+                match_status, match_tone = (
+                    "Adjacent Category (Within 1 Band)",
+                    "neutral",
+                )
+            else:
+                match_status, match_tone = "Discrepant Category", "warning"
+
+            evaluation_text = (
+                f"Predicted AQI {today_prediction_value}; live AQI {live_aqi}; "
+                f"absolute difference {absolute_difference} AQI points."
             )
+            observation_date = live_result.get("observation_date", today_str)
+            observation_display_date = live_display
+            observation_timestamp = live_timestamp
+
+        else:
+            live_aqi = None
+            live_display = f"Today ({today.strftime('%d %b %Y')})"
+            live_timestamp = f"Live telemetry unavailable for {today_str}"
+            data_source = "Historical AQI dataset"
+            freshness_status = "Live Telemetry Unavailable for Today"
+            freshness_note = (
+                f"No verified live observation is available for {today_str}."
+            )
+            warning = live_result.get("warning_message") or freshness_note
 
             observed_payload = {
                 "aqi": None,
@@ -776,97 +831,194 @@ class ForecastEngine:
                 "badge": "bg-slate-100 text-slate-700 border-slate-300",
                 "pollutants": {},
                 "timestamp": live_timestamp,
-                "display_date": live_display_date,
+                "display_date": live_display,
                 "data_source": data_source,
-                "is_live": False
+                "is_live": False,
             }
 
-        # Generate matched historical series for comparison chart (last 14 days)
+            absolute_difference = None
+            percentage_error = None
+            category_match = None
+            rank_difference = None
+            match_status, match_tone = "Live Observation Pending", "neutral"
+            evaluation_text = (
+                "A direct live comparison is unavailable because no verified "
+                "live reading was returned for today. Historical evaluation "
+                "is reported separately."
+            )
+            observation_date = latest_date_str
+            observation_display_date = latest_display
+            observation_timestamp = historical_record["timestamp"]
+
+        # Retrospective evaluation. Each prediction uses rows before its date.
         matched_series = []
-        start_idx = max(8, len(valid_sub) - 14)
-        for i in range(start_idx, len(valid_sub)):
-            t_row = valid_sub.iloc[i]
-            d_str = str(t_row["dt"].date())
-            o_aqi = round(float(t_row["aqi"]), 1)
-            f_i = build_features_prior_to(i)
-            if model_1 is not None and scaler_1 is not None:
-                p_i = round(float(model_1.predict(scaler_1.transform(f_i))[0]), 1)
-            else:
-                p_i = o_aqi
-            p_i = max(15.0, min(p_i, 495.0))
-            d_diff = round(abs(p_i - o_aqi), 1)
+        start_idx = max(8, len(daily) - 14)
+
+        for idx in range(start_idx, len(daily)):
+            target = daily.iloc[idx]
+            target_date = target["dt"]
+            actual = round(float(target[self.target_col]), 1)
+            prior = daily.iloc[:idx].copy()
+
+            if prior.empty:
+                continue
+
+            try:
+                predicted, source = self._predict_from_prior(
+                    prior,
+                    target_date,
+                    horizon=1,
+                    all_cities=all_cities,
+                    city=city,
+                )
+            except Exception:
+                logger.exception(
+                    "Could not evaluate historical prediction for %s on %s",
+                    city,
+                    target_date.date(),
+                )
+                continue
+
+            predicted = round(self._clamp_aqi(predicted), 1)
+
             matched_series.append({
-                "date": d_str,
-                "display_label": t_row["dt"].strftime("%d %b"),
-                "observed_aqi": o_aqi,
-                "predicted_aqi": p_i,
-                "absolute_diff": d_diff
+                "date": str(target_date.date()),
+                "display_label": target_date.strftime("%d %b"),
+                "observed_aqi": actual,
+                "predicted_aqi": predicted,
+                "absolute_diff": round(abs(predicted - actual), 1),
+                "prediction_source": source,
             })
+
+        if matched_series:
+            actual_values = np.asarray(
+                [x["observed_aqi"] for x in matched_series], dtype=float
+            )
+            predicted_values = np.asarray(
+                [x["predicted_aqi"] for x in matched_series], dtype=float
+            )
+            errors = predicted_values - actual_values
+
+            city_mae = float(np.mean(np.abs(errors)))
+            city_rmse = float(np.sqrt(np.mean(errors ** 2)))
+
+            actual_categories = [
+                get_aqi_category_info(v)["name"].lower()
+                for v in actual_values
+            ]
+            predicted_categories = [
+                get_aqi_category_info(v)["name"].lower()
+                for v in predicted_values
+            ]
+            category_accuracy = float(
+                np.mean([
+                    actual == predicted
+                    for actual, predicted in zip(
+                        actual_categories, predicted_categories
+                    )
+                ]) * 100.0
+            )
+
+            evaluation_status = (
+                "ML-only historical evaluation"
+                if all(
+                    x["prediction_source"] == "ml_model"
+                    for x in matched_series
+                )
+                else "Baseline included; not pure ML evaluation"
+            )
+        else:
+            city_mae = None
+            city_rmse = None
+            category_accuracy = None
+            evaluation_status = "Insufficient historical samples"
 
         return {
             "city": city,
             "today_date": today_str,
-            "today_formatted": today_date.strftime("%d %b %Y"),
-            "observation_date": live_date_str if is_live else latest_date_str,
-            "observation_display_date": live_display_date if is_live else hist_display_date,
-            "observation_timestamp": live_timestamp if is_live else hist_timestamp,
-            "is_live": is_live,
-            "today_live_available": today_live_available,
-            "warning_message": warning_message,
-            "data_source": data_source if is_live else historical_baseline_record["data_source"],
-            "station_count": station_count,
+            "today_formatted": today.strftime("%d %b %Y"),
+            "observation_date": observation_date,
+            "observation_display_date": observation_display_date,
+            "observation_timestamp": observation_timestamp,
+            "is_live": live_available,
+            "today_live_available": live_available,
+            "warning_message": warning,
+            "data_source": data_source,
+            "station_count": (
+                live_result.get(
+                    "station_count",
+                    historical_record["station_count"],
+                )
+                if live_available
+                else historical_record["station_count"]
+            ),
             "freshness_status": freshness_status,
             "freshness_note": freshness_note,
-            
             "observed": observed_payload,
-            "latest_historical_observation": historical_baseline_record,
-            
+            "latest_historical_observation": historical_record,
             "predicted": {
-                "aqi": today_pred_aqi,
-                "category": today_cat_info["name"],
-                "color": today_cat_info["color"],
-                "badge": today_cat_info["badge"],
-                "model_name": "Our Model's Today AQI Prediction",
-                "model_type": "Direct Multi-Horizon Regressor",
+                "aqi": today_prediction_value,
+                "category": today_category["name"],
+                "color": today_category["color"],
+                "badge": today_category["badge"],
+                "model_name": "Today's AQI Prediction",
+                "model_type": (
+                    "Direct Multi-Horizon Regressor"
+                    if prediction_source == "ml_model"
+                    else "Rolling-Mean Baseline"
+                    if prediction_source == "rolling_mean_baseline"
+                    else "Unavailable: insufficient prior observations"
+                ),
+                "prediction_source": prediction_source,
                 "prediction_date": today_str,
-                "prediction_date_formatted": today_date.strftime("%d %b %Y"),
-                "prediction_timestamp": f"Issued for Today ({today_date.strftime('%d %b %Y')}) using ML model (Zero Target Leakage)",
-                "confidence_interval": {
-                    "lower": pred_ci_lower,
-                    "upper": pred_ci_upper,
-                    "level": "95%"
-                }
+                "prediction_date_formatted": today.strftime("%d %b %Y"),
+                "prediction_timestamp": (
+                    f"Issued for {today.strftime('%d %b %Y')} "
+                    "using prior observations"
+                ),
+                "confidence_interval": ci,
             },
-            
             "comparison": {
-                "comparison_available": comparison_available,
-                "absolute_difference": abs_diff,
-                "percentage_error": pct_err,
-                "category_match": cat_match,
-                "rank_difference": rank_diff,
+                "comparison_available": live_available,
+                "absolute_difference": absolute_difference,
+                "percentage_error": percentage_error,
+                "category_match": category_match,
+                "rank_difference": rank_difference,
                 "match_status": match_status,
                 "match_tone": match_tone,
-                "evaluation_text": eval_text
+                "evaluation_text": evaluation_text,
             },
-            
             "matched_series": matched_series,
-            
             "model_performance_summary": {
-                "horizon_1_test_mae": h1_metrics.get("test_mae", 19.93),
-                "horizon_1_test_rmse": h1_metrics.get("test_rmse", 30.22),
-                "horizon_1_test_r2": h1_metrics.get("test_r2", 0.8667),
-                "horizon_1_baseline_mae": h1_metrics.get("baseline_mae", 19.07),
-                "category_accuracy": h1_metrics.get("cpcb_category_accuracy", 73.4),
-                "evaluation_partition": "Chronological 15% Unseen Holdout Partition (2025)",
-                "validation_approach": "Time-based walk-forward validation with zero target leakage"
+                # These metrics are calculated from this city's retrospective
+                # matched series, not copied from cached global metrics.
+                "horizon_1_test_mae": city_mae,
+                "horizon_1_test_rmse": city_rmse,
+                "horizon_1_test_r2": h1_metrics.get("test_r2"),
+                "horizon_1_baseline_mae": h1_metrics.get("baseline_mae"),
+                "category_accuracy": category_accuracy,
+                "evaluation_partition": "Recent matched historical observations",
+                "validation_approach": (
+                    "Prior-only historical predictions; target AQI excluded "
+                    "from its own features"
+                ),
+                "evaluation_status": evaluation_status,
+                "prediction_source": (
+                    "ML model"
+                    if self.models.get(1) is not None
+                    and self.scalers.get(1) is not None
+                    else "Rolling-mean baseline"
+                ),
             },
-            
             "scientific_disclosure": (
-                "Observed values represent official CPCB CAAQMS station-aggregated metrics. "
-                "Our model estimates are produced strictly from historical lags available prior to the observation date, "
-                "ensuring genuine out-of-sample evaluation without synthetic inflation or look-ahead contamination."
-            )
+                "Retrospective predictions are generated from observations "
+                "strictly before each target date. If model artifacts are "
+                "unavailable, a rolling-mean baseline is used and identified "
+                "explicitly. Retrospective metrics are not official holdout "
+                "metrics from model training."
+            ),
         }
 
-# Backward compatibility alias
+
+# Backward compatibility alias used by older imports.
 ModelManager = ForecastEngine
